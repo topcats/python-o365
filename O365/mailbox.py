@@ -72,12 +72,17 @@ class Folder(ApiComponent):
             self.total_items_count = cloud_data.get(self._cc('totalItemCount'),
                                                     0)
             self.updated_at = dt.datetime.now()
+        else:
+            self.folder_id = 'root'
 
     def __str__(self):
         return self.__repr__()
 
     def __repr__(self):
         return '{} from resource: {}'.format(self.name, self.main_resource)
+
+    def __eq__(self, other):
+        return self.folder_id == other.folder_id
 
     def get_folders(self, limit=None, *, query=None, order_by=None, batch=None):
         """ Returns a list of child folders matching the query
@@ -142,12 +147,15 @@ class Folder(ApiComponent):
         :return: one Message
         :rtype: Message or None
         """
-        if object_id is not None and query is not None:
-            raise ValueError('Must provide object id or query but not both.')
+        if object_id is None and query is None:
+            raise ValueError('Must provide object id or query.')
 
         if object_id is not None:
             url = self.build_url(self._endpoints.get('message').format(id=object_id))
-            response = self.con.get(url)
+            params = None
+            if query and (query.has_selects or query.has_expands):
+                params = query.as_params()
+            response = self.con.get(url, params=params)
             if not response:
                 return None
 
@@ -565,3 +573,12 @@ class MailBox(Folder):
         return self.folder_constructor(parent=self, name='Outbox',
                                        folder_id=OutlookWellKnowFolderNames
                                        .OUTBOX.value)
+
+    def archive_folder(self):
+        """ Shortcut to get Archive Folder instance
+
+        :rtype: mailbox.Folder
+        """
+        return self.folder_constructor(parent=self, name='Archive',
+                                       folder_id=OutlookWellKnowFolderNames
+                                       .ARCHIVE.value)

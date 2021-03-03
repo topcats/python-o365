@@ -4,7 +4,7 @@ import os
 from setuptools import setup, find_packages
 
 
-VERSION = '1.1.11b'
+VERSION = '2.0.14'
 
 # Available classifiers: https://pypi.org/pypi?%3Aaction=list_classifiers
 CLASSIFIERS = [
@@ -20,6 +20,7 @@ CLASSIFIERS = [
     'Programming Language :: Python :: 3.6',
     'Programming Language :: Python :: 3.7',
     'Programming Language :: Python :: 3.8',
+    'Programming Language :: Python :: 3.9',
     'Operating System :: OS Independent',
 ]
 
@@ -30,7 +31,7 @@ def read(fname):
 
 
 requires = [
-    'requests>=2.0.0',
+    'requests>=2.18.0',
     'requests_oauthlib>=1.2.0',
     'python-dateutil>=2.7',
     'pytz>=2018.5',

@@ -2,10 +2,8 @@ import json
 import logging
 import os
 import time
-import warnings
-from pathlib import Path
 
-from oauthlib.oauth2 import TokenExpiredError
+from oauthlib.oauth2 import TokenExpiredError, WebApplicationClient, BackendApplicationClient
 from requests import Session
 from requests.adapters import HTTPAdapter
 from requests.exceptions import HTTPError, RequestException, ProxyError
@@ -16,7 +14,7 @@ from requests.packages.urllib3.util.retry import Retry
 from requests_oauthlib import OAuth2Session
 from stringcase import pascalcase, camelcase, snakecase
 from tzlocal import get_localzone
-from pytz import UnknownTimeZoneError, UTC
+from pytz import UnknownTimeZoneError, UTC, timezone as get_timezone
 
 from .utils import ME_RESOURCE, BaseTokenBackend, FileSystemTokenBackend, Token
 
@@ -53,7 +51,11 @@ DEFAULT_SCOPES = {
     'onedrive': ['Files.Read.All'],
     'onedrive_all': ['Files.ReadWrite.All'],
     'sharepoint': ['Sites.Read.All'],
-    'sharepoint_dl': ['Sites.ReadWrite.All']
+    'sharepoint_dl': ['Sites.ReadWrite.All'],
+    'settings_all': ['MailboxSettings.ReadWrite'],
+    'tasks': ['Tasks.Read'],
+    'tasks_all': ['Tasks.ReadWrite'],
+    'presence': ['Presence.Read']
 }
 
 
@@ -66,7 +68,7 @@ class Protocol:
     _oauth_scopes = {}  # Dictionary of {scopes_name: [scope1, scope2]}
 
     def __init__(self, *, protocol_url=None, api_version=None,
-                 default_resource=ME_RESOURCE,
+                 default_resource=None,
                  casing_function=None, protocol_scope_prefix=None,
                  timezone=None, **kwargs):
         """ Create a new protocol object
@@ -79,7 +81,7 @@ class Protocol:
         :param function casing_function: the casing transform function to be
          used on api keywords (camelcase / pascalcase)
         :param str protocol_scope_prefix: prefix url for scopes
-        :param pytz.UTC timezone: preferred timezone, defaults to the
+        :param pytz.UTC or str timezone: preferred timezone, defaults to the
          system timezone
         :raises ValueError: if protocol_url or api_version are not supplied
         """
@@ -90,9 +92,11 @@ class Protocol:
         self.protocol_scope_prefix = protocol_scope_prefix or ''
         self.api_version = api_version
         self.service_url = '{}{}/'.format(protocol_url, api_version)
-        self.default_resource = default_resource
+        self.default_resource = default_resource or ME_RESOURCE
         self.use_default_casing = True if casing_function is None else False
         self.casing_function = casing_function or camelcase
+        if timezone and isinstance(timezone, str):
+            timezone = get_timezone(timezone)
         try:
             self.timezone = timezone or get_localzone()  # pytz timezone
         except UnknownTimeZoneError as e:
@@ -165,11 +169,11 @@ class Protocol:
         scopes = set()
         for app_part in user_provided_scopes:
             for scope in self._oauth_scopes.get(app_part, [(app_part,)]):
-                scopes.add(self._prefix_scope(scope))
+                scopes.add(self.prefix_scope(scope))
 
         return list(scopes)
 
-    def _prefix_scope(self, scope):
+    def prefix_scope(self, scope):
         """ Inserts the protocol scope prefix if required"""
         if self.protocol_scope_prefix:
             if isinstance(scope, tuple):
@@ -194,7 +198,7 @@ class MSGraphProtocol(Protocol):
     _oauth_scope_prefix = 'https://graph.microsoft.com/'
     _oauth_scopes = DEFAULT_SCOPES
 
-    def __init__(self, api_version='v1.0', default_resource=ME_RESOURCE,
+    def __init__(self, api_version='v1.0', default_resource=None,
                  **kwargs):
         """ Create a new Microsoft Graph protocol object
 
@@ -231,7 +235,7 @@ class MSOffice365Protocol(Protocol):
     _oauth_scope_prefix = 'https://outlook.office.com/'
     _oauth_scopes = DEFAULT_SCOPES
 
-    def __init__(self, api_version='v2.0', default_resource=ME_RESOURCE,
+    def __init__(self, api_version='v2.0', default_resource=None,
                  **kwargs):
         """ Create a new Office 365 protocol object
 
@@ -263,6 +267,54 @@ class MSOffice365Protocol(Protocol):
         self.max_top_value = 999  # Max $top parameter value
 
 
+class MSBusinessCentral365Protocol(Protocol):
+
+    """ A Microsoft Business Central Protocol Implementation
+    https://docs.microsoft.com/en-us/dynamics-nav/api-reference/v1.0/endpoints-apis-for-dynamics
+    """
+
+    _protocol_url = 'https://api.businesscentral.dynamics.com/'
+    _oauth_scope_prefix = 'https://api.businesscentral.dynamics.com/'
+    _oauth_scopes = DEFAULT_SCOPES
+    _protocol_scope_prefix = 'https://api.businesscentral.dynamics.com/'
+
+    def __init__(self, api_version='v1.0', default_resource=None,environment=None,
+                 **kwargs):
+        """ Create a new Microsoft Graph protocol object
+
+        _protocol_url = 'https://api.businesscentral.dynamics.com/'
+
+        _oauth_scope_prefix = 'https://api.businesscentral.dynamics.com/'
+
+        :param str api_version: api version to use
+        :param str default_resource: the default resource to use when there is
+         nothing explicitly specified during the requests
+        """
+        if environment:
+            _version = "2.0"
+            _environment = "/"+environment
+        else:
+            _version = "1.0"
+            _environment = ''
+
+        self._protocol_url = "{}v{}{}/api/".format(self._protocol_url, _version, _environment)
+
+        super().__init__(protocol_url=self._protocol_url,
+                         api_version=api_version,
+                         default_resource=default_resource,
+                         casing_function=camelcase,
+                         protocol_scope_prefix=self._protocol_scope_prefix,
+                         **kwargs)
+
+        self.keyword_data_store['message_type'] = 'microsoft.graph.message'
+        self.keyword_data_store['event_message_type'] = 'microsoft.graph.eventMessage'
+        self.keyword_data_store[
+            'file_attachment_type'] = '#microsoft.graph.fileAttachment'
+        self.keyword_data_store[
+            'item_attachment_type'] = '#microsoft.graph.itemAttachment'
+        self.max_top_value = 999  # Max $top parameter value
+
+
 class Connection:
     """ Handles all communication (requests) between the app and the server """
 
@@ -271,8 +323,11 @@ class Connection:
     def __init__(self, credentials, *, scopes=None,
                  proxy_server=None, proxy_port=8080, proxy_username=None,
                  proxy_password=None, requests_delay=200, raise_http_errors=True,
-                 request_retries=3, token_file_name=None, token_backend=None,
-                 tenant_id='common', **kwargs):
+                 request_retries=3, token_backend=None,
+                 tenant_id='common',
+                 auth_flow_type='authorization',
+                 timeout=None, json_encoder=None,
+                 verify_ssl=True, **kwargs):
         """ Creates an API connection object
 
         :param tuple credentials: a tuple of (client_id, client_secret)
@@ -285,7 +340,6 @@ class Connection:
         :param str proxy_password: the proxy password
         :param int requests_delay: number of milliseconds to wait between api
          calls.
-
          The Api will respond with 429 Too many requests if more than
          17 requests are made per second. Defaults to 200 milliseconds
          just in case more than 1 connection is making requests
@@ -294,27 +348,40 @@ class Connection:
          will raise as exceptions
         :param int request_retries: number of retries done when the server
          responds with 5xx error codes.
-        :param str token_file_name: custom token file name to be used when
-         storing the OAuth token credentials.
         :param BaseTokenBackend token_backend: the token backend used to get
          and store tokens
         :param str tenant_id: use this specific tenant id, defaults to common
+        :param str auth_flow_type: the auth method flow style used: Options:
+            - 'authorization': 2 step web style grant flow using an authentication url
+            - 'public': 2 step web style grant flow using an authentication url for public apps where
+            client secret cannot be secured
+            - 'credentials': also called client credentials grant flow using only the cliend id and secret
+        :param float or tuple timeout: How long to wait for the server to send
+            data before giving up, as a float, or a tuple (connect timeout, read timeout)
+        :param JSONEncoder json_encoder: The JSONEnocder to use during the JSON serialization on the request.
+        :param bool verify_ssl: set the verify flag on the requests library
         :param dict kwargs: any extra params passed to Connection
         :raises ValueError: if credentials is not tuple of
          (client_id, client_secret)
         """
-        if not isinstance(credentials, tuple) or len(credentials) != 2 or (
-                not credentials[0] and not credentials[1]):
-            raise ValueError('Provide valid auth credentials')
+        if auth_flow_type == 'public':  # allow client id only for public flow
+            if isinstance(credentials, str): 
+                credentials = (credentials,)
+            if not isinstance(credentials, tuple) or len(credentials) != 1 or (not credentials[0]):
+                raise ValueError('Provide client id only for public flow credentials')
+        else:
+            if not isinstance(credentials, tuple) or len(credentials) != 2 or (not credentials[0] and not credentials[1]):
+                raise ValueError('Provide valid auth credentials')
 
+        self._auth_flow_type = auth_flow_type  # 'authorization' or 'credentials' or 'public'
+        if auth_flow_type == 'credentials' and tenant_id == 'common':
+            raise ValueError('When using the "credentials" auth_flow the "tenant_id" must be set')
+
+        self.tenant_id = tenant_id
         self.auth = credentials
         self.scopes = scopes
         self.store_token = True
-        # TODO: remove "token_file_name" in a future release
-        if token_file_name is not None:
-            warnings.warn('"token_file_name" will be removed in future versions.'
-                          ' Please use "token_backend" instead', DeprecationWarning)
-        token_backend = token_backend or FileSystemTokenBackend(token_filename=token_file_name)
+        token_backend = token_backend or FileSystemTokenBackend(**kwargs)
         if not isinstance(token_backend, BaseTokenBackend):
             raise ValueError('"token_backend" must be an instance of a subclass of BaseTokenBackend')
         self.token_backend = token_backend
@@ -326,23 +393,21 @@ class Connection:
         self._previous_request_at = None  # store previous request time
         self.raise_http_errors = raise_http_errors
         self.request_retries = request_retries
+        self.timeout = timeout
+        self.json_encoder = json_encoder
+        self.verify_ssl = verify_ssl
 
-        self.naive_session = Session()  # requests Session object
-        self.naive_session.proxies = self.proxy
-
-        if self.request_retries:
-            retry = Retry(total=self.request_retries, read=self.request_retries,
-                          connect=self.request_retries,
-                          backoff_factor=RETRIES_BACKOFF_FACTOR,
-                          status_forcelist=RETRIES_STATUS_LIST)
-            adapter = HTTPAdapter(max_retries=retry)
-            self.naive_session.mount('http://', adapter)
-            self.naive_session.mount('https://', adapter)
+        self.naive_session = None  # lazy loaded: holds a requests Session object
 
         self._oauth2_authorize_url = 'https://login.microsoftonline.com/' \
                                      '{}/oauth2/v2.0/authorize'.format(tenant_id)
         self._oauth2_token_url = 'https://login.microsoftonline.com/' \
                                  '{}/oauth2/v2.0/token'.format(tenant_id)
+        self.oauth_redirect_url = 'https://login.microsoftonline.com/common/oauth2/nativeclient'
+
+    @property
+    def auth_flow_type(self):
+        return self._auth_flow_type
 
     def set_proxy(self, proxy_server, proxy_port, proxy_username,
                   proxy_password):
@@ -371,19 +436,8 @@ class Connection:
                     "https": "https://{}:{}".format(proxy_server, proxy_port),
                 }
 
-    def check_token_file(self):
-        """ Checks if the token file exists at the given position
-
-        :return: if file exists or not
-        :rtype: bool
-        """
-        # TODO: remove this method in a future release
-        warnings.warn('This method will be removed in future versions',
-                      DeprecationWarning)
-        return self.token_backend.check_token() if hasattr(self.token_backend, 'check_token') else None
-
     def get_authorization_url(self, requested_scopes=None,
-                              redirect_uri=OAUTH_REDIRECT_URL, **kwargs):
+                              redirect_uri=None, **kwargs):
         """ Initializes the oauth authorization flow, getting the
         authorization url that the user must approve.
 
@@ -394,66 +448,45 @@ class Connection:
         :rtype: str
         """
 
-        # TODO: remove this warning in future releases
-        if redirect_uri == OAUTH_REDIRECT_URL:
-            warnings.warn('The default redirect uri was changed in version 1.1.4. to'
-                          ' "https://login.microsoftonline.com/common/oauth2/nativeclient".'
-                          ' You may have to change the registered app "redirect uri" or pass here the old "redirect_uri"',
-                          DeprecationWarning)
+        redirect_uri = redirect_uri or self.oauth_redirect_url
 
-        client_id, client_secret = self.auth
-
-        if requested_scopes:
-            scopes = requested_scopes
-        elif self.scopes is not None:
-            scopes = self.scopes
-        else:
+        scopes = requested_scopes or self.scopes
+        if not scopes:
             raise ValueError('Must provide at least one scope')
 
-        self.session = oauth = OAuth2Session(client_id=client_id,
-                                             redirect_uri=redirect_uri,
-                                             scope=scopes)
-        self.session.proxies = self.proxy
-        if self.request_retries:
-            retry = Retry(total=self.request_retries, read=self.request_retries,
-                          connect=self.request_retries,
-                          backoff_factor=RETRIES_BACKOFF_FACTOR,
-                          status_forcelist=RETRIES_STATUS_LIST)
-            adapter = HTTPAdapter(max_retries=retry)
-            self.session.mount('http://', adapter)
-            self.session.mount('https://', adapter)
+        self.session = oauth = self.get_session(redirect_uri=redirect_uri,
+                                                scopes=scopes)
 
         # TODO: access_type='offline' has no effect according to documentation
         #  This is done through scope 'offline_access'.
         auth_url, state = oauth.authorization_url(
             url=self._oauth2_authorize_url, access_type='offline')
 
-        return auth_url
+        return auth_url, state
 
-    def request_token(self, authorization_url, store_token=True,
-                      token_path=None, **kwargs):
+    def request_token(self, authorization_url, *,
+                      state=None,
+                      redirect_uri=None,
+                      requested_scopes=None,
+                      store_token=True,
+                      **kwargs):
         """ Authenticates for the specified url and gets the token, save the
         token for future based if requested
 
-        :param str authorization_url: url given by the authorization flow
+        :param str or None authorization_url: url given by the authorization flow
+        :param str state: session-state identifier for web-flows
+        :param str redirect_uri: callback url for web-flows
+        :param lst requested_scopes: a list of scopes to be requested.
+         Only used when auth_flow_type is 'credentials'
         :param bool store_token: whether or not to store the token,
-         so u don't have to keep opening the auth link and
+         so you don't have to keep opening the auth link and
          authenticating every time
-        :param Path token_path: full path to where the token should be saved to
         :param kwargs: allow to pass unused params in conjunction with Connection
         :return: Success/Failure
         :rtype: bool
         """
 
-        if self.session is None:
-            raise RuntimeError("Fist call 'get_authorization_url' to "
-                               "generate a valid oauth object")
-
-        # TODO: remove token_path in future versions
-        if token_path is not None:
-            warnings.warn('"token_path" param will be removed in future versions.'
-                          ' Use a TokenBackend instead', DeprecationWarning)
-        _, client_secret = self.auth
+        redirect_uri = redirect_uri or self.oauth_redirect_url
 
         # Allow token scope to not match requested scope.
         # (Other auth libraries allow this, but Requests-OAuthlib
@@ -461,12 +494,35 @@ class Connection:
         os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
         os.environ['OAUTHLIB_IGNORE_SCOPE_CHANGE'] = '1'
 
+        scopes = requested_scopes or self.scopes
+
+        if self.session is None:
+            if self.auth_flow_type in ('authorization', 'public'):
+                self.session = self.get_session(state=state,
+                                                redirect_uri=redirect_uri)
+            elif self.auth_flow_type == 'credentials':
+                self.session = self.get_session(scopes=scopes)
+            else:
+                raise ValueError('"auth_flow_type" must be "authorization", "public" or "credentials"')
+
         try:
-            self.token_backend.token = Token(self.session.fetch_token(
-                token_url=self._oauth2_token_url,
-                authorization_response=authorization_url,
-                include_client_id=True,
-                client_secret=client_secret))
+            if self.auth_flow_type == 'authorization':
+                self.token_backend.token = Token(self.session.fetch_token(
+                    token_url=self._oauth2_token_url,
+                    authorization_response=authorization_url,
+                    include_client_id=True,
+                    client_secret=self.auth[1]))
+            elif self.auth_flow_type == 'public':
+                self.token_backend.token = Token(self.session.fetch_token(
+                    token_url=self._oauth2_token_url,
+                    authorization_response=authorization_url,
+                    include_client_id=True))
+            elif self.auth_flow_type == 'credentials':
+                self.token_backend.token = Token(self.session.fetch_token(
+                    token_url=self._oauth2_token_url,
+                    include_client_id=True,
+                    client_secret=self.auth[1],
+                    scope=scopes))
         except Exception as e:
             log.error('Unable to fetch auth token. Error: {}'.format(str(e)))
             return False
@@ -475,29 +531,54 @@ class Connection:
             self.token_backend.save_token()
         return True
 
-    def get_session(self, token_path=None):
+    def get_session(self, *, state=None,
+                    redirect_uri=None,
+                    load_token=False,
+                    scopes=None):
         """ Create a requests Session object
 
-        :param Path token_path: (Only oauth) full path to where the token
-         should be load from
-        :return: A ready to use requests session
+        :param str state: session-state identifier to rebuild OAuth session (CSRF protection)
+        :param str redirect_uri: callback URL specified in previous requests
+        :param list(str) scopes: list of scopes we require access to
+        :param bool load_token: load and ensure token is present
+        :return: A ready to use requests session, or a rebuilt in-flow session
         :rtype: OAuth2Session
         """
-        # TODO: remove token_path in future versions
-        if token_path is not None:
-            warnings.warn('"token_path" param will be removed in future versions.'
-                          ' Use a TokenBackend instead.', DeprecationWarning)
 
-        # gets a fresh token from the store
-        token = self.token_backend.get_token()
+        redirect_uri = redirect_uri or self.oauth_redirect_url
 
-        if token:
-            client_id, _ = self.auth
-            session = OAuth2Session(client_id=client_id, token=token)
+        client_id = self.auth[0]
+
+        if self.auth_flow_type in ('authorization', 'public'):
+            oauth_client = WebApplicationClient(client_id=client_id)
+        elif self.auth_flow_type == 'credentials':
+            oauth_client = BackendApplicationClient(client_id=client_id)
         else:
-            raise RuntimeError(
-                'No auth token found. Authentication Flow needed')
+            raise ValueError('"auth_flow_type" must be "authorization", "credentials" or "public"')
 
+        requested_scopes = scopes or self.scopes
+
+        if load_token:
+            # gets a fresh token from the store
+            token = self.token_backend.get_token()
+            if token is None:
+                raise RuntimeError('No auth token found. Authentication Flow needed')
+
+            oauth_client.token = token
+            if self.auth_flow_type in ('authorization', 'public'):
+                requested_scopes = None  # the scopes are already in the token (Not if type is backend)
+            session = OAuth2Session(client_id=client_id,
+                                    client=oauth_client,
+                                    token=token,
+                                    scope=requested_scopes)
+        else:
+            session = OAuth2Session(client_id=client_id,
+                                    client=oauth_client,
+                                    state=state,
+                                    redirect_uri=redirect_uri,
+                                    scope=requested_scopes)
+
+        session.verify = self.verify_ssl
         session.proxies = self.proxy
 
         if self.request_retries:
@@ -511,6 +592,23 @@ class Connection:
 
         return session
 
+    def get_naive_session(self):
+        """ Creates and returns a naive session """
+        naive_session = Session()  # requests Session object
+        naive_session.proxies = self.proxy
+        naive_session.verify = self.verify_ssl
+
+        if self.request_retries:
+            retry = Retry(total=self.request_retries, read=self.request_retries,
+                          connect=self.request_retries,
+                          backoff_factor=RETRIES_BACKOFF_FACTOR,
+                          status_forcelist=RETRIES_STATUS_LIST)
+            adapter = HTTPAdapter(max_retries=retry)
+            naive_session.mount('http://', adapter)
+            naive_session.mount('https://', adapter)
+
+        return naive_session
+
     def refresh_token(self):
         """
         Refresh the OAuth authorization token.
@@ -520,21 +618,38 @@ class Connection:
         :return bool: Success / Failure
         """
         if self.session is None:
-            self.session = self.get_session()
+            self.session = self.get_session(load_token=True)
 
         token = self.token_backend.token
-        if token and token.is_long_lived:
-            client_id, client_secret = self.auth
-            token = Token(self.session.refresh_token(
-                self._oauth2_token_url,
-                client_id=client_id,
-                client_secret=client_secret))
+        if not token:
+            raise RuntimeError('Token not found.')
+
+        if token.is_long_lived or self.auth_flow_type == 'credentials':
+            log.info('Refreshing token')
+            if self.auth_flow_type == 'authorization':
+                client_id, client_secret = self.auth
+                self.token_backend.token = Token(
+                    self.session.refresh_token(
+                        self._oauth2_token_url,
+                        client_id=client_id,
+                        client_secret=client_secret)
+                )
+            elif self.auth_flow_type == 'public':
+                client_id = self.auth[0]
+                self.token_backend.token = Token(
+                    self.session.refresh_token(
+                        self._oauth2_token_url,
+                        client_id=client_id)
+                )
+            elif self.auth_flow_type == 'credentials':
+                if self.request_token(None, store_token=False) is False:
+                    log.error('Refresh for Client Credentials Grant Flow failed.')
+                    return False
+            log.info('New oauth token fetched by refresh method')
         else:
             log.error('You can not refresh an access token that has no "refreh_token" available.'
-                      'Include "offline_access" scope when authentication to get a "refresh_token"')
+                      'Include "offline_access" scope when authenticating to get a "refresh_token"')
             return False
-
-        self.token_backend.token = token
 
         if self.store_token:
             self.token_backend.save_token()
@@ -546,8 +661,9 @@ class Connection:
             dif = round(time.time() - self._previous_request_at,
                         2) * 1000  # difference in miliseconds
             if dif < self.requests_delay:
-                time.sleep(
-                    (self.requests_delay - dif) / 1000)  # sleep needs seconds
+                sleep_for = (self.requests_delay - dif)
+                log.info('Sleeping for {} miliseconds'.format(sleep_for))
+                time.sleep(sleep_for / 1000)  # sleep needs seconds
         self._previous_request_at = time.time()
 
     def _internal_request(self, request_obj, url, method, **kwargs):
@@ -560,7 +676,6 @@ class Connection:
         :return: Response of the request
         :rtype: requests.Response
         """
-
         method = method.lower()
         if method not in self._allowed_methods:
             raise ValueError('Method must be one of the allowed ones')
@@ -574,7 +689,10 @@ class Connection:
                 kwargs['headers']['Content-type'] = 'application/json'
             if 'data' in kwargs and kwargs['data'] is not None and kwargs['headers'].get(
                     'Content-type') == 'application/json':
-                kwargs['data'] = json.dumps(kwargs['data'])  # convert to json
+                kwargs['data'] = json.dumps(kwargs['data'], cls=self.json_encoder)  # convert to json
+
+        if self.timeout is not None:
+            kwargs['timeout'] = self.timeout
 
         request_done = False
         token_refreshed = False
@@ -585,8 +703,7 @@ class Connection:
                 log.info('Requesting ({}) URL: {}'.format(method.upper(), url))
                 log.info('Request parameters: {}'.format(kwargs))
                 # auto_retry will occur inside this function call if enabled
-                response = request_obj.request(method, url,
-                                               **kwargs)
+                response = request_obj.request(method, url, **kwargs)
                 response.raise_for_status()  # raise 4XX and 5XX error codes.
                 log.info('Received response ({}) from URL {}'.format(
                     response.status_code, response.url))
@@ -594,15 +711,27 @@ class Connection:
                 return response
             except TokenExpiredError as e:
                 # Token has expired, try to refresh the token and try again on the next loop
-                if not self.token_backend.token.is_long_lived:
+                log.info('Oauth Token is expired')
+                if self.token_backend.token.is_long_lived is False and self.auth_flow_type == 'authorization':
                     raise e
                 if token_refreshed:
                     # Refresh token done but still TokenExpiredError raise
                     raise RuntimeError('Token Refresh Operation not working')
-                log.info('Oauth Token is expired, fetching a new token')
-                self.refresh_token()
-                log.info('New oauth token fetched')
-                token_refreshed = True
+                should_rt = self.token_backend.should_refresh_token(self)
+                if should_rt is True:
+                    # The backend has checked that we can refresh the token
+                    if self.refresh_token() is False:
+                        raise RuntimeError('Token Refresh Operation not working')
+                    token_refreshed = True
+                elif should_rt is False:
+                    # the token was refreshed by another instance and updated into
+                    # this instance, so: update the session token and
+                    # go back to the loop and try the request again.
+                    request_obj.token = self.token_backend.token
+                else:
+                    # the refresh was performed by the tokend backend.
+                    token_refreshed = True
+
             except (ConnectionError, ProxyError, SSLError, Timeout) as e:
                 # We couldn't connect to the target url, raise error
                 log.debug('Connection Error calling: {}.{}'
@@ -649,6 +778,9 @@ class Connection:
         :return: Response of the request
         :rtype: requests.Response
         """
+        if self.naive_session is None:
+            # lazy creation of a naive session
+            self.naive_session = self.get_naive_session()
         return self._internal_request(self.naive_session, url, method, **kwargs)
 
     def oauth_request(self, url, method, **kwargs):
@@ -662,7 +794,7 @@ class Connection:
         """
         # oauth authentication
         if self.session is None:
-            self.session = self.get_session()
+            self.session = self.get_session(load_token=True)
 
         return self._internal_request(self.session, url, method, **kwargs)
 
@@ -720,50 +852,15 @@ class Connection:
         """
         return self.oauth_request(url, 'delete', **kwargs)
 
-    def _save_token(self, token, token_path=None):
-        """ Save the specified token dictionary to a specified file path
-
-        :param dict token: token dictionary returned by the oauth token request,
-         to be saved
-        :param Path token_path: Path to the file with token information saved
-        :return: Success/Failure
-        :rtype: bool
-        """
-        # TODO: remove this method in future versions
-        warnings.warn('This method is deprecated. Use a TokenBackend instead.', DeprecationWarning)
-        return False
-
-    def _load_token(self, token_path=None):
-        """ Load the specified token dictionary from specified file path
-
-        :param Path token_path: Path to the file with token information saved
-        :return: token data
-        :rtype: dict
-        """
-        # TODO: remove this method in future versions
-        warnings.warn('This method is deprecated. Use a TokenBackend instead.', DeprecationWarning)
-        return False
-
-    def _delete_token(self, token_path=None):
-        """ Delete the specified token dictionary from specified file path
-
-        :param Path token_path: Path to the file with token information saved
-        :return: Success/Failure
-        :rtype: bool
-        """
-        # TODO: remove this method in future versions
-        warnings.warn('This method is deprecated. Use a TokenBackend instead.', DeprecationWarning)
-        return False
-
     def __del__(self):
         """
         Clear the session by closing it
         This should be called manually by the user "del account.con"
         There is no guarantee that this method will be called by the garbage collection
-        But this is not an issue because this connections willbe automatically closed.
+        But this is not an issue because this connections will be automatically closed.
         """
-        if self.session:
-            self.session.close()
+        if hasattr(self, 'session') and self.session is not None:
+                self.session.close()
 
 
 def oauth_authentication_flow(client_id, client_secret, scopes=None,
@@ -790,14 +887,15 @@ def oauth_authentication_flow(client_id, client_secret, scopes=None,
     con = Connection(credentials, scopes=protocol.get_scopes_for(scopes),
                      **kwargs)
 
-    consent_url = con.get_authorization_url(**kwargs)
+    consent_url, _ = con.get_authorization_url(**kwargs)
+
     print('Visit the following url to give consent:')
     print(consent_url)
 
-    token_url = input('Paste the authenticated url here: ')
+    token_url = input('Paste the authenticated url here:\n')
 
     if token_url:
-        result = con.request_token(token_url, **kwargs)
+        result = con.request_token(token_url, **kwargs)  # no need to pass state as the session is the same
         if result:
             print('Authentication Flow Completed. Oauth Access Token Stored. '
                   'You can now use the API.')

@@ -1,17 +1,26 @@
 import datetime as dt
 import logging
+from enum import Enum
 
 import pytz
 # noinspection PyPep8Naming
 from bs4 import BeautifulSoup as bs
 from dateutil.parser import parse
+from pathlib import Path
 
 from .utils import OutlookWellKnowFolderNames, ApiComponent, \
     BaseAttachments, BaseAttachment, AttachableMixin, ImportanceLevel, \
     TrackerSet, Recipient, HandleRecipientsMixin, CaseEnum
 from .calendar import Event
+from .category import Category
 
 log = logging.getLogger(__name__)
+
+
+class RecipientType(Enum):
+    TO = 'to'
+    CC = 'cc'
+    BCC = 'bcc'
 
 
 class MeetingMessageType(CaseEnum):
@@ -31,16 +40,54 @@ class Flag(CaseEnum):
 class MessageAttachment(BaseAttachment):
     _endpoints = {
         'attach': '/messages/{id}/attachments',
-        'attachment': '/messages/{id}/attachments/{ida}'
+        'attachment': '/messages/{id}/attachments/{ida}',
     }
 
 
 class MessageAttachments(BaseAttachments):
     _endpoints = {
         'attachments': '/messages/{id}/attachments',
-        'attachment': '/messages/{id}/attachments/{ida}'
+        'attachment': '/messages/{id}/attachments/{ida}',
+        'get_mime': '/messages/{id}/attachments/{ida}/$value',
     }
     _attachment_constructor = MessageAttachment
+
+    def save_as_eml(self, attachment, to_path=None):
+        """ Saves this message as and EML to the file system
+        :param MessageAttachment attachment: the MessageAttachment to store as eml.
+        :param Path or str to_path: the path where to store this file
+        """
+        if not attachment or not isinstance(attachment, MessageAttachment) \
+                or attachment.attachment_id is None or attachment.attachment_type != 'item':
+            raise ValueError('Must provide a saved "item" attachment of type MessageAttachment')
+
+        if to_path is None:
+            to_path = Path('message_eml.eml')
+        else:
+            if not isinstance(to_path, Path):
+                to_path = Path(to_path)
+
+        if not to_path.suffix:
+            to_path = to_path.with_suffix('.eml')
+
+        msg_id = self._parent.object_id
+        if msg_id is None:
+            raise RuntimeError('Attempting to get the mime contents of an unsaved message')
+
+        url = self.build_url(self._endpoints.get('get_mime').format(id=msg_id, ida=attachment.attachment_id))
+
+        response = self._parent.con.get(url)
+
+        if not response:
+            return False
+
+        mime_content = response.content
+
+        if mime_content:
+            with to_path.open('wb') as file_obj:
+                file_obj.write(mime_content)
+            return True
+        return False
 
 
 class MessageFlag(ApiComponent):
@@ -149,8 +196,8 @@ class MessageFlag(ApiComponent):
             self._cc('flagStatus'): self._cc(self.__status.value)
         }
         if self.__status is Flag.Flagged:
-            data[self._cc('startDateTime')] = self._build_date_time_time_zone(self.__start)
-            data[self._cc('dueDateTime')] = self._build_date_time_time_zone(self.__due_date)
+            data[self._cc('startDateTime')] = self._build_date_time_time_zone(self.__start) if self.__start is not None else None
+            data[self._cc('dueDateTime')] = self._build_date_time_time_zone(self.__due_date) if self.__due_date is not None else None
 
         if self.__status is Flag.Complete:
             data[self._cc('completedDateTime')] = self._build_date_time_time_zone(self.__completed)
@@ -172,7 +219,8 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         'copy_message': '/messages/{id}/copy',
         'create_reply': '/messages/{id}/createReply',
         'create_reply_all': '/messages/{id}/createReplyAll',
-        'forward_message': '/messages/{id}/createForward'
+        'forward_message': '/messages/{id}/createForward',
+        'get_mime': '/messages/{id}/$value',
     }
 
     def __init__(self, *, parent=None, con=None, **kwargs):
@@ -226,14 +274,26 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
             local_tz) if self.__sent else None
 
         self.__attachments = MessageAttachments(parent=self, attachments=[])
+        self.__attachments.add({self._cloud_data_key: cloud_data.get(cc('attachments'), [])})
         self.has_attachments = cloud_data.get(cc('hasAttachments'), False)
-        if self.has_attachments and download_attachments:
-            self.attachments.download_attachments()
         self.__subject = cloud_data.get(cc('subject'), '')
+        self.__body_preview = cloud_data.get(cc('bodyPreview'), '')
         body = cloud_data.get(cc('body'), {})
         self.__body = body.get(cc('content'), '')
-        self.body_type = body.get(cc('contentType'),
-                                  'HTML')  # default to HTML for new messages
+        self.body_type = body.get(cc('contentType'), 'HTML')  # default to HTML for new messages
+
+        unique_body = cloud_data.get(cc('uniqueBody'), {})
+        self.__unique_body = unique_body.get(cc('content'), '')
+        self.unique_body_type = unique_body.get(cc('contentType'), 'HTML')  # default to HTML for new messages
+
+        if self.has_attachments is False and self.body_type.upper() == 'HTML':
+            # test for inline attachments (Azure responds with hasAttachments=False when there are only inline attachments):
+            if any(img.get('src', '').startswith('cid:') for img in self.get_body_soup().find_all('img')):
+                self.has_attachments = True
+
+        if self.has_attachments and download_attachments:
+            self.attachments.download_attachments()
+
         self.__sender = self._recipient_from_cloud(
             cloud_data.get(cc('from'), None), field=cc('from'))
         self.__to = self._recipients_from_cloud(
@@ -264,6 +324,7 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self.__is_draft = cloud_data.get(cc('isDraft'), kwargs.get('is_draft',
                                                                    True))
         self.conversation_id = cloud_data.get(cc('conversationId'), None)
+        self.conversation_index = cloud_data.get(cc('conversationIndex'), None)
         self.folder_id = cloud_data.get(cc('parentFolderId'), None)
 
         flag_data = cloud_data.get(cc('flag'), {})
@@ -280,6 +341,9 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
 
     def __repr__(self):
         return 'Subject: {}'.format(self.subject)
+
+    def __eq__(self, other):
+        return self.object_id == other.object_id
 
     @property
     def is_read(self):
@@ -320,6 +384,11 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self._track_changes.add('subject')
 
     @property
+    def body_preview(self):
+        """ Returns the body preview """
+        return self.__body_preview
+
+    @property
     def body(self):
         """ Body of the email message
 
@@ -334,13 +403,23 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         if self.__body:
             if not value:
                 self.__body = ''
-            else:
+            elif self.body_type == 'html':
                 soup = bs(self.__body, 'html.parser')
                 soup.body.insert(0, bs(value, 'html.parser'))
                 self.__body = str(soup)
+            else:
+                self.__body = ''.join((value, '\n', self.__body))
         else:
             self.__body = value
         self._track_changes.add('body')
+
+    @property
+    def unique_body(self):
+        """ The unique body of this message
+            Requires a select to retrieve it.
+        :rtype: str
+        """
+        return self.__unique_body
 
     @property
     def created(self):
@@ -426,13 +505,27 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
     @categories.setter
     def categories(self, value):
         if isinstance(value, list):
-            self.__categories = value
+            self.__categories = []
+            for val in value:
+                if isinstance(val, Category):
+                    self.__categories.append(val.name)
+                else:
+                    self.__categories.append(val)
         elif isinstance(value, str):
             self.__categories = [value]
-        elif isinstance(value, tuple):
-            self.__categories = list(value)
+        elif isinstance(value, Category):
+            self.__categories = [value.name]
         else:
             raise ValueError('categories must be a list')
+        self._track_changes.add('categories')
+
+    def add_category(self, category):
+        """ Adds a category to this message current categories list """
+
+        if isinstance(category, Category):
+            self.__categories.append(category.name)
+        else:
+            self.__categories.append(category)
         self._track_changes.add('categories')
 
     @property
@@ -696,6 +789,28 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
 
         return True
 
+    def mark_as_unread(self):
+        """ Marks this message as unread in the cloud
+
+        :return: Success / Failure
+        :rtype: bool
+        """
+        if self.object_id is None or self.__is_draft:
+            raise RuntimeError('Attempting to mark as unread an unsaved Message')
+
+        data = {self._cc('isRead'): False}
+
+        url = self.build_url(
+            self._endpoints.get('get_message').format(id=self.object_id))
+
+        response = self.con.patch(url, data=data)
+        if not response:
+            return False
+
+        self.__is_read = False
+
+        return True
+
     def move(self, folder):
         """ Move the message to a given folder
 
@@ -725,7 +840,10 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         if not response:
             return False
 
+        message = response.json()
+
         self.folder_id = folder_id
+        self.object_id = message.get('id')
 
         return True
 
@@ -872,6 +990,7 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
             self.__modified = parse(self.__modified).astimezone(
                 self.protocol.timezone) if self.__modified else None
 
+            self.web_link = message.get(self._cc('webLink'), '')
         else:
             self.__modified = self.protocol.timezone.localize(dt.datetime.now())
 
@@ -924,3 +1043,39 @@ class Message(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         event_data = data.get(self._cc('event'))
 
         return Event(parent=self, **{self._cloud_data_key: event_data})
+
+    def get_mime_content(self):
+        """ Returns the MIME contents of this message """
+        if self.object_id is None:
+            raise RuntimeError('Attempting to get the mime contents of an unsaved message')
+
+        url = self.build_url(self._endpoints.get('get_mime').format(id=self.object_id))
+
+        response = self.con.get(url)
+
+        if not response:
+            return None
+
+        return response.content
+
+    def save_as_eml(self, to_path=None):
+        """ Saves this message as and EML to the file system
+        :param Path or str to_path: the path where to store this file
+        """
+
+        if to_path is None:
+            to_path = Path('message_eml.eml')
+        else:
+            if not isinstance(to_path, Path):
+                to_path = Path(to_path)
+
+        if not to_path.suffix:
+            to_path = to_path.with_suffix('.eml')
+
+        mime_content = self.get_mime_content()
+
+        if mime_content:
+            with to_path.open('wb') as file_obj:
+                file_obj.write(mime_content)
+            return True
+        return False

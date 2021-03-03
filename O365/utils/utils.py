@@ -12,6 +12,8 @@ from .decorators import fluent
 
 ME_RESOURCE = 'me'
 USERS_RESOURCE = 'users'
+GROUPS_RESOURCE = 'groups'
+SITES_RESOURCE = 'sites'
 
 NEXT_LINK_KEYWORD = '@odata.nextLink'
 
@@ -50,6 +52,7 @@ class OutlookWellKnowFolderNames(Enum):
     DRAFTS = 'Drafts'
     SENT = 'SentItems'
     OUTBOX = 'Outbox'
+    ARCHIVE = 'Archive'
 
 
 class OneDriveWellKnowFolderNames(Enum):
@@ -326,15 +329,10 @@ class ApiComponent:
         self.protocol = protocol() if isinstance(protocol, type) else protocol
         if self.protocol is None:
             raise ValueError('Protocol not provided to Api Component')
-        self.main_resource = (self._parse_resource(
-            main_resource if main_resource is not None
-            else protocol.default_resource))
-        # noinspection PyUnresolvedReferences
-        self._base_url = '{}{}'.format(self.protocol.service_url,
-                                       self.main_resource)
-        if self._base_url.endswith('/'):
-            # when self.main_resource is empty then remove the last slash.
-            self._base_url = self._base_url[:-1]
+        mr, bu = self.build_base_url(main_resource)
+        self.main_resource = mr
+        self._base_url = bu
+
         super().__init__()
 
     def __str__(self):
@@ -347,15 +345,48 @@ class ApiComponent:
     def _parse_resource(resource):
         """ Parses and completes resource information """
         resource = resource.strip() if resource else resource
-        if resource in {ME_RESOURCE, USERS_RESOURCE}:
+        if resource in {ME_RESOURCE, USERS_RESOURCE, GROUPS_RESOURCE, SITES_RESOURCE}:
             return resource
+        elif resource.startswith('user:'):
+            # user resource shorthand
+            resource = resource.replace('user:', '', 1)
+            return '{}/{}'.format(USERS_RESOURCE, resource)
         elif '@' in resource and not resource.startswith(USERS_RESOURCE):
+            # user resource backup
             # when for example accessing a shared mailbox the
             # resource is set to the email address. we have to prefix
             # the email with the resource 'users/' so --> 'users/email_address'
             return '{}/{}'.format(USERS_RESOURCE, resource)
+        elif resource.startswith('group:'):
+            # group resource shorthand
+            resource = resource.replace('group:', '', 1)
+            return '{}/{}'.format(GROUPS_RESOURCE, resource)
+        elif resource.startswith('site:'):
+            # sharepoint site resource shorthand
+            resource = resource.replace('site:', '', 1)
+            return '{}/{}'.format(SITES_RESOURCE, resource)
         else:
             return resource
+
+    def build_base_url(self, resource):
+        """
+        Builds the base url of this ApiComponent
+        :param str resource: the resource to build the base url
+        """
+        main_resource = self._parse_resource(resource if resource is not None else self.protocol.default_resource)
+        # noinspection PyUnresolvedReferences
+        base_url = '{}{}'.format(self.protocol.service_url, main_resource)
+        if base_url.endswith('/'):
+            # when self.main_resource is empty then remove the last slash.
+            base_url = base_url[:-1]
+        return main_resource, base_url
+
+    def set_base_url(self, resource):
+        """
+        Sets the base urls for this ApiComponent
+        :param str resource: the resource to build the base url
+        """
+        self.main_resource, self._base_url = self.build_base_url(resource)
 
     def build_url(self, endpoint):
         """ Returns a url for a given endpoint using the protocol
@@ -570,6 +601,8 @@ class Query:
         self._selects = set()
         self._expands = set()
         self._search = None
+        self._open_group_flag = []  # stores if the next attribute must be grouped
+        self._close_group_flag = []  # stores if the last attribute must be closing a group
 
     def __str__(self):
         return 'Filter: {}\nOrder: {}\nSelect: {}\nExpand: {}\nSearch: {}'.format(self.get_filters(),
@@ -654,10 +687,12 @@ class Query:
             params['$filter'] = self.get_filters()
         if self.has_order:
             params['$orderby'] = self.get_order()
-        if self.has_selects:
-            params['$select'] = self.get_selects()
-        if self.has_expands:
+        if self.has_expands and not self.has_selects:
             params['$expand'] = self.get_expands()
+        if self.has_selects and not self.has_expands:
+            params['$select'] = self.get_selects()
+        if self.has_expands and self.has_selects:
+            params['$expand'] = '{}($select={})'.format(self.get_expands(), self.get_selects())
         if self._search:
             params['$search'] = self._search
             params.pop('$filter', None)
@@ -705,9 +740,16 @@ class Query:
             filters_list = self._filters
             if isinstance(filters_list[-1], Enum):
                 filters_list = filters_list[:-1]
-            return ' '.join(
-                [fs.value if isinstance(fs, Enum) else fs[1] for fs in
-                 filters_list]).strip()
+            filters = ' '.join(
+                [fs.value if isinstance(fs, Enum) else fs[1] for fs in filters_list]
+            ).strip()
+
+            # closing opened groups automatically
+            open_groups = len([x for x in self._open_group_flag if x is False])
+            for i in range(open_groups - len(self._close_group_flag)):
+                filters += ')'
+
+            return filters
         else:
             return None
 
@@ -720,27 +762,9 @@ class Query:
         # in the order_by first
         if not self.has_order:
             return None
-        filter_order_clauses = OrderedDict([(filter_attr[0], None)
-                                            for filter_attr in self._filters
-                                            if isinstance(filter_attr, tuple)])
 
-        # any order_by attribute that appears in the filters is ignored
-        order_by_dict = self._order_by.copy()
-        for filter_oc in filter_order_clauses.keys():
-            direction = order_by_dict.pop(filter_oc, None)
-            filter_order_clauses[filter_oc] = direction
-
-        filter_order_clauses.update(
-            order_by_dict)  # append any remaining order_by clause
-
-        if filter_order_clauses:
-            return ','.join(['{} {}'.format(attribute,
-                                            direction if direction else '')
-                            .strip()
-                             for attribute, direction in
-                             filter_order_clauses.items()])
-        else:
-            return None
+        return ','.join(['{} {}'.format(attribute, direction or '').strip()
+                         for attribute, direction in self._order_by.items()])
 
     def get_selects(self):
         """ Returns the result select clause
@@ -810,6 +834,8 @@ class Query:
         self._attribute = None
         self._chain = None
         self._search = None
+        self._open_group_flag = []
+        self._close_group_flag = []
 
         return self
 
@@ -844,6 +870,16 @@ class Query:
         self._attribute = self._get_mapping(attribute)
         return self
 
+    @fluent
+    def on_list_field(self, field):
+        """ Apply query on a list field, to be used along with chain()
+
+        :param str field: field name (note: name is case sensitive)
+        :rtype: Query
+        """
+        self._attribute = 'fields/' + field
+        return self
+
     def remove_filter(self, filter_attr):
         """ Removes a filter given the attribute name """
         filter_attr = self._get_mapping(filter_attr)
@@ -851,7 +887,7 @@ class Query:
         remove_chain = False
 
         for flt in self._filters:
-            if isinstance(flt, tuple):
+            if isinstance(flt, list):
                 if flt[0] == filter_attr:
                     remove_chain = True
                 else:
@@ -870,7 +906,13 @@ class Query:
             if self._filters and not isinstance(self._filters[-1],
                                                 ChainOperator):
                 self._filters.append(self._chain)
-            self._filters.append((self._attribute, filter_data[0], filter_data[1]))
+            sentence, attrs = filter_data
+            for i, group in enumerate(self._open_group_flag):
+                if group is True:
+                    # Open a group
+                    sentence = '(' + sentence
+                    self._open_group_flag[i] = False  # set to done
+            self._filters.append([self._attribute, sentence, attrs])
         else:
             raise ValueError(
                 'Attribute property needed. call on_attribute(attribute) '
@@ -904,13 +946,16 @@ class Query:
                     word.isoformat())  # convert datetime to isoformat
         elif isinstance(word, bool):
             word = str(word).lower()
+        elif word is None:
+            word = 'null'
         return word
 
     @staticmethod
     def _prepare_sentence(attribute, operation, word, negation=False):
         negation = 'not' if negation else ''
         attrs = (negation, attribute, operation, word)
-        return '{} {} {} {}'.format(negation, attribute, operation, word).strip(), attrs
+        sentence = '{} {} {} {}'.format(negation, attribute, operation, word).strip()
+        return sentence, attrs
 
     @fluent
     def logical_operator(self, operation, word):
@@ -1030,7 +1075,7 @@ class Query:
         return self.function('endswith', word)
 
     @fluent
-    def iterable(self, iterable_name, *, collection, attribute, word, func=None,
+    def iterable(self, iterable_name, *, collection, word, attribute=None, func=None,
                  operation=None):
         """ Performs a filter with the OData 'iterable_name' keyword
         on the collection
@@ -1044,8 +1089,8 @@ class Query:
 
         :param str iterable_name: the OData name of the iterable
         :param str collection: the collection to apply the any keyword on
-        :param str attribute: the attribute of the collection to check
         :param str word: the word to check
+        :param str attribute: the attribute of the collection to check
         :param str func: the logical function to apply to the attribute inside
          the collection
         :param str operation: the logical operation to apply to the attribute
@@ -1066,6 +1111,11 @@ class Query:
         collection = self._get_mapping(collection)
         attribute = self._get_mapping(attribute)
 
+        if attribute is None:
+            attribute = 'a'  # it's the same iterated object
+        else:
+            attribute = 'a/{}'.format(attribute)
+
         if func is not None:
             sentence = self._prepare_function(func, attribute, word)
         else:
@@ -1073,7 +1123,7 @@ class Query:
 
         filter_str, attrs = sentence
 
-        filter_data = '{}/{}(a:a/{})'.format(collection, iterable_name, filter_str), attrs
+        filter_data = '{}/{}(a:{})'.format(collection, iterable_name, filter_str), attrs
         self._add_filter(*filter_data)
 
         self._attribute = current_att
@@ -1081,7 +1131,7 @@ class Query:
         return self
 
     @fluent
-    def any(self, *, collection, attribute, word, func=None, operation=None):
+    def any(self, *, collection, word, attribute=None, func=None, operation=None):
         """ Performs a filter with the OData 'any' keyword on the collection
 
         For example:
@@ -1093,8 +1143,8 @@ class Query:
         emailAddresses/any(a:a/address eq 'george@best.com')
 
         :param str collection: the collection to apply the any keyword on
-        :param str attribute: the attribute of the collection to check
         :param str word: the word to check
+        :param str attribute: the attribute of the collection to check
         :param str func: the logical function to apply to the attribute
          inside the collection
         :param str operation: the logical operation to apply to the
@@ -1102,11 +1152,11 @@ class Query:
         :rtype: Query
         """
 
-        return self.iterable('any', collection=collection, attribute=attribute,
-                             word=word, func=func, operation=operation)
+        return self.iterable('any', collection=collection, word=word,
+                             attribute=attribute, func=func, operation=operation)
 
     @fluent
-    def all(self, *, collection, attribute, word, func=None, operation=None):
+    def all(self, *, collection, word, attribute=None, func=None, operation=None):
         """ Performs a filter with the OData 'all' keyword on the collection
 
         For example:
@@ -1118,8 +1168,8 @@ class Query:
         emailAddresses/all(a:a/address eq 'george@best.com')
 
         :param str collection: the collection to apply the any keyword on
-        :param str attribute: the attribute of the collection to check
         :param str word: the word to check
+        :param str attribute: the attribute of the collection to check
         :param str func: the logical function to apply to the attribute
          inside the collection
         :param str operation: the logical operation to apply to the
@@ -1127,8 +1177,8 @@ class Query:
         :rtype: Query
         """
 
-        return self.iterable('all', collection=collection, attribute=attribute,
-                             word=word, func=func, operation=operation)
+        return self.iterable('all', collection=collection, word=word,
+                             attribute=attribute, func=func, operation=operation)
 
     @fluent
     def order_by(self, attribute=None, *, ascending=True):
@@ -1145,4 +1195,25 @@ class Query:
             raise ValueError(
                 'Attribute property needed. call on_attribute(attribute) '
                 'or new(attribute)')
+        return self
+
+    def open_group(self):
+        """ Applies a precedence grouping in the next filters """
+        self._open_group_flag.append(True)
+        return self
+
+    def close_group(self):
+        """ Closes a grouping for previous filters """
+        if self._filters:
+            if len(self._open_group_flag) < (len(self._close_group_flag) + 1):
+                raise RuntimeError('Not enough open groups to close.')
+            if isinstance(self._filters[-1], ChainOperator):
+                flt_sentence = self._filters[-2]
+            else:
+                flt_sentence = self._filters[-1]
+
+            flt_sentence[1] = flt_sentence[1] + ')'  # closing the group
+            self._close_group_flag.append(False)  # flag a close group was added
+        else:
+            raise RuntimeError("No filters present. Can't close a group")
         return self

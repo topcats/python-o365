@@ -2,7 +2,7 @@ import logging
 import warnings
 from pathlib import Path
 from time import sleep
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 from dateutil.parser import parse
 
@@ -28,7 +28,7 @@ ALLOWED_PDF_EXTENSIONS = {'.csv', '.doc', '.docx', '.odp', '.ods', '.odt',
 class DownloadableMixin:
 
     def download(self, to_path=None, name=None, chunk_size='auto',
-                 convert_to_pdf=False):
+                 convert_to_pdf=False, output=None):
         """ Downloads this file to the local drive. Can download the
         file in chunks with multiple requests to the server.
 
@@ -41,26 +41,29 @@ class DownloadableMixin:
          however only 1 request)
         :param bool convert_to_pdf: will try to download the converted pdf
          if file extension in ALLOWED_PDF_EXTENSIONS
+        :param RawIOBase output: (optional) an opened io object to write to.
+         if set, the to_path and name will be ignored
         :return: Success / Failure
         :rtype: bool
         """
         # TODO: Add download with more than one request (chunk_requests) with
-        # header 'Range'. For example: 'Range': 'bytes=0-1024'
+        #  header 'Range'. For example: 'Range': 'bytes=0-1024'
 
-        if to_path is None:
-            to_path = Path()
-        else:
-            if not isinstance(to_path, Path):
-                to_path = Path(to_path)
+        if not output:
+            if to_path is None:
+                to_path = Path()
+            else:
+                if not isinstance(to_path, Path):
+                    to_path = Path(to_path)
 
-        if not to_path.exists():
-            raise FileNotFoundError('{} does not exist'.format(to_path))
+            if not to_path.exists():
+                raise FileNotFoundError('{} does not exist'.format(to_path))
 
-        if name and not Path(name).suffix and self.name:
-            name = name + Path(self.name).suffix
+            if name and not Path(name).suffix and self.name:
+                name = name + Path(self.name).suffix
 
-        name = name or self.name
-        to_path = to_path / name
+            name = name or self.name
+            to_path = to_path / name
 
         url = self.build_url(
             self._endpoints.get('download').format(id=self.object_id))
@@ -73,6 +76,7 @@ class DownloadableMixin:
                     stream = True
                 else:
                     stream = False
+                chunk_size = None
             elif isinstance(chunk_size, int):
                 stream = True
             else:
@@ -88,14 +92,22 @@ class DownloadableMixin:
                     log.debug('Downloading driveitem Request failed: {}'.format(
                         response.reason))
                     return False
-                with to_path.open(mode='wb') as output:
+
+                def write_output(out):
                     if stream:
                         for chunk in response.iter_content(
                                 chunk_size=chunk_size):
                             if chunk:
-                                output.write(chunk)
+                                out.write(chunk)
                     else:
-                        output.write(response.content)
+                        out.write(response.content)
+
+                if output:
+                    write_output(output)
+                else:
+                    with to_path.open(mode='wb') as output:
+                        write_output(output)
+
         except Exception as e:
             log.error(
                 'Error downloading driveitem {}. Error: {}'.format(self.name,
@@ -368,7 +380,7 @@ class DriveItemPermission(ApiComponent):
 
         if roles in {'view', 'read'}:
             data = {'roles': ['read']}
-        elif roles == {'edit', 'write'}:
+        elif roles in {'edit', 'write'}:
             data = {'roles': ['write']}
         else:
             raise ValueError('"{}" is not a valid share_type'.format(roles))
@@ -436,9 +448,6 @@ class DriveItem(ApiComponent):
             raise ValueError('Need a parent or a connection but not both')
         self.con = parent.con if parent else con
         self._parent = parent if isinstance(parent, DriveItem) else None
-        self.drive = parent if isinstance(parent, Drive) else (
-            parent.drive if isinstance(parent.drive, Drive) else kwargs.get(
-                'drive', None))
 
         # Choose the main_resource passed in kwargs over parent main_resource
         main_resource = kwargs.pop('main_resource', None) or (
@@ -461,6 +470,26 @@ class DriveItem(ApiComponent):
         cloud_data = kwargs.get(self._cloud_data_key, {})
 
         self.object_id = cloud_data.get(self._cc('id'))
+
+        parent_reference = cloud_data.get(self._cc('parentReference'), {})
+        self.parent_id = parent_reference.get('id', None)
+        self.drive_id = parent_reference.get(self._cc('driveId'), None)
+        self.parent_path = parent_reference.get(self._cc("path"), None)
+
+        remote_item = cloud_data.get(self._cc('remoteItem'), None)
+        if remote_item is not None:
+            self.drive = None  # drive is unknown?
+            self.remote_item = self._classifier(remote_item)(parent=self, **{
+                self._cloud_data_key: remote_item})
+            self.parent_id = self.remote_item.parent_id
+            self.drive_id = self.remote_item.drive_id
+            self.set_base_url('drives/{}'.format(self.drive_id))  # changes main_resource and _base_url
+        else:
+            self.drive = parent if isinstance(parent, Drive) else (
+                parent.drive if isinstance(parent.drive, Drive) else kwargs.get(
+                    'drive', None))
+            self.remote_item = None
+
         self.name = cloud_data.get(self._cc('name'), '')
         self.web_url = cloud_data.get(self._cc('webUrl'))
         created_by = cloud_data.get(self._cc('createdBy'), {}).get('user', None)
@@ -481,14 +510,6 @@ class DriveItem(ApiComponent):
         self.description = cloud_data.get(self._cc('description'), '')
         self.size = cloud_data.get(self._cc('size'), 0)
         self.shared = cloud_data.get(self._cc('shared'), {}).get('scope', None)
-
-        parent_reference = cloud_data.get(self._cc('parentReference'), {})
-        self.parent_id = parent_reference.get('id', None)
-        self.drive_id = parent_reference.get(self._cc('driveId'), None)
-
-        remote_item = cloud_data.get(self._cc('remoteItem'), None)
-        self.remote_item = self._classifier(remote_item)(parent=self, **{
-            self._cloud_data_key: remote_item}) if remote_item else None
 
         # Thumbnails
         self.thumbnails = cloud_data.get(self._cc('thumbnails'), [])
@@ -551,6 +572,24 @@ class DriveItem(ApiComponent):
             else:
                 # return the drive
                 return self.drive
+
+    def get_drive(self):
+        """
+        Returns this item drive
+        :return: Drive of this item
+        :rtype: Drive or None
+        """
+        if not self.drive_id:
+            return None
+
+        url = self.build_url('')
+        response = self.con.get(url)
+        if not response:
+            return None
+
+        drive = response.json()
+
+        return Drive(parent=self, main_resource='', **{self._cloud_data_key: drive})
 
     def get_thumbnails(self, size=None):
         """ Returns this Item Thumbnails. Thumbnails are not supported on
@@ -869,7 +908,7 @@ class DriveItem(ApiComponent):
         }
         if share_type in {'view', 'read'}:
             data['roles'] = ['read']
-        elif share_type == {'edit', 'write'}:
+        elif share_type in {'edit', 'write'}:
             data['roles'] = ['write']
         else:
             raise ValueError(
@@ -981,7 +1020,7 @@ class Folder(DriveItem):
             'name', None)
 
     def get_items(self, limit=None, *, query=None, order_by=None, batch=None):
-        """ Returns all the items inside this folder
+        """ Returns generator all the items inside this folder
 
         :param int limit: max no. of folders to get. Over 999 uses batch.
         :param query: applies a OData filter to the request
@@ -990,8 +1029,8 @@ class Folder(DriveItem):
         :type order_by: Query or str
         :param int batch: batch size, retrieves items in
          batches allowing to retrieve more items than the limit.
-        :return: list of items in this folder
-        :rtype: list[DriveItem] or Pagination
+        :return: items in this folder
+        :rtype: generator of DriveItem or Pagination
         """
 
         url = self.build_url(
@@ -1006,10 +1045,10 @@ class Folder(DriveItem):
             params['$orderby'] = order_by
 
         if query:
-            if query.has_filters:
-                warnings.warn('Filters are not allowed by the '
-                              'Api Provider in this method')
-                query.clear_filters()
+            # if query.has_filters:
+            #     warnings.warn('Filters are not allowed by the '
+            #                   'Api Provider in this method')
+            #     query.clear_filters()
             if isinstance(query, str):
                 params['$filter'] = query
             else:
@@ -1032,6 +1071,27 @@ class Folder(DriveItem):
                               next_link=next_link, limit=limit)
         else:
             return items
+
+    def get_child_folders(self, limit=None, *, query=None, order_by=None, batch=None):
+        """ Returns all the folders inside this folder
+
+        :param int limit: max no. of folders to get. Over 999 uses batch.
+        :param query: applies a OData filter to the request
+        :type query: Query or str
+        :param order_by: orders the result set based on this condition
+        :type order_by: Query or str
+        :param int batch: batch size, retrieves items in
+         batches allowing to retrieve more items than the limit.
+        :return: folder items in this folder
+        :rtype: generator of DriveItem or Pagination
+        """
+
+        if query:
+            query = query.on_attribute('folder').unequal(None)
+        else:
+            query = self.q('folder').unequal(None)
+
+        return self.get_items(limit=limit, query=query, order_by=order_by, batch=batch)
 
     def create_child_folder(self, name, description=None):
         """ Creates a Child Folder
@@ -1064,16 +1124,32 @@ class Folder(DriveItem):
     def download_contents(self, to_folder=None):
         """ This will download each file and folder sequentially.
         Caution when downloading big folder structures
-
         :param drive.Folder to_folder: folder where to store the contents
         """
-        to_folder = to_folder or Path()
-        if not to_folder.exists():
-            to_folder.mkdir()
-
-        for item in self.get_items(query=self.new_query().select('id', 'size')):
+        if to_folder is None:
+            try:
+                to_folder = Path() / self.name
+            except Exception as e:
+                log.error('Could not create folder with name: {}. Error: {}'.format(self.name, e))
+                to_folder = Path()  # fallback to the same folder
+        else:
+            to_folder = Path() / to_folder
+            if not to_folder.exists():
+                to_folder.mkdir()
+        if not isinstance(to_folder,str):
+            if not to_folder.exists():
+                to_folder.mkdir()
+        else:
+            to_folder = Path() / self.name
+        
+        for item in self.get_items(query=self.new_query().select('id', 'size', 'folder', 'name')):
             if item.is_folder and item.child_count > 0:
                 item.download_contents(to_folder=to_folder / item.name)
+            elif item.is_folder and item.child_count == 0:
+                # Create child folder without contents.
+                child_folder = to_folder / item.name
+                if not child_folder.exists():
+                    child_folder.mkdir()
             else:
                 item.download(to_folder)
 
@@ -1096,8 +1172,8 @@ class Folder(DriveItem):
         :type order_by: Query or str
         :param int batch: batch size, retrieves items in
          batches allowing to retrieve more items than the limit.
-        :return: list of items in this folder
-        :rtype: list[DriveItem] or Pagination
+        :return: items in this folder matching search
+        :rtype: generator of DriveItem or Pagination
         """
         if not isinstance(search_text, str) or not search_text:
             raise ValueError('Provide a valid search_text')
@@ -1143,38 +1219,54 @@ class Folder(DriveItem):
         else:
             return items
 
-    def upload_file(self, item, chunk_size=DEFAULT_UPLOAD_CHUNK_SIZE):
+    def upload_file(self, item, item_name=None, chunk_size=DEFAULT_UPLOAD_CHUNK_SIZE,
+                    upload_in_chunks=False, stream=None, stream_size=None,
+                    conflict_handling=None):
         """ Uploads a file
 
         :param item: path to the item you want to upload
         :type item: str or Path
-        :param chunk_size: Only applies if file is bigger than 4MB.
+        :param item_name: name of the item on the server. None to use original name
+        :type item_name: str or Path
+        :param chunk_size: Only applies if file is bigger than 4MB or upload_in_chunks is True.
          Chunk size for uploads. Must be a multiple of 327.680 bytes
+        :param upload_in_chunks: force the method to upload the file in chunks
+        :param io.BufferedIOBase stream: (optional) an opened io object to read into.
+         if set, the to_path and name will be ignored
+        :param int stream_size: size of stream, required if using stream
+        :param conflict_handling: How to handle conflicts.
+         NOTE: works for chunk upload only (>4MB or upload_in_chunks is True)
+         None to use default (overwrite). Options: fail | replace | rename
+        :type conflict_handling: str
         :return: uploaded file
         :rtype: DriveItem
         """
 
-        if item is None:
-            raise ValueError('Item must be a valid path to file')
-        item = Path(item) if not isinstance(item, Path) else item
+        if not stream:
+            if item is None:
+                raise ValueError('Item must be a valid path to file')
+            item = Path(item) if not isinstance(item, Path) else item
 
-        if not item.exists():
-            raise ValueError('Item must exist')
-        if not item.is_file():
-            raise ValueError('Item must be a file')
+            if not item.exists():
+                raise ValueError('Item must exist')
+            if not item.is_file():
+                raise ValueError('Item must be a file')
 
-        file_size = item.stat().st_size
+        file_size = (stream_size if stream_size is not None else item.stat().st_size)
 
-        if file_size <= UPLOAD_SIZE_LIMIT_SIMPLE:
+        if not upload_in_chunks and file_size <= UPLOAD_SIZE_LIMIT_SIMPLE:
             # Simple Upload
             url = self.build_url(
                 self._endpoints.get('simple_upload').format(id=self.object_id,
-                                                            filename=item.name))
+                                                            filename=quote(item.name if item_name is None else item_name)))
             # headers = {'Content-type': 'text/plain'}
             headers = {'Content-type': 'application/octet-stream'}
             # headers = None
-            with item.open(mode='rb') as file:
-                data = file.read()
+            if stream:
+                data = stream.read()
+            else:
+                with item.open(mode='rb') as file:
+                    data = file.read()
 
             response = self.con.put(url, headers=headers, data=data)
             if not response:
@@ -1188,22 +1280,31 @@ class Folder(DriveItem):
             # Resumable Upload
             url = self.build_url(
                 self._endpoints.get('create_upload_session').format(
-                    id=self.object_id, filename=item.name))
+                    id=self.object_id, filename=quote(item.name if item_name is None else item_name)))
 
-            response = self.con.post(url)
+            # If not None, add conflict handling to request
+            file_data = {}
+            if conflict_handling:
+                file_data["item"] = {"@microsoft.graph.conflictBehavior": conflict_handling }
+
+            response = self.con.post(url, data=file_data)
             if not response:
                 return None
 
             data = response.json()
 
             upload_url = data.get(self._cc('uploadUrl'), None)
+            log.info('Resumable upload on url: {}'.format(upload_url))
+            expiration_date = data.get(self._cc('expirationDateTime'), None)
+            if expiration_date:
+                log.info('Expiration Date for this upload url is: {}'.format(expiration_date))
             if upload_url is None:
                 log.error('Create upload session response without '
                           'upload_url for file {}'.format(item.name))
                 return None
 
-            current_bytes = 0
-            with item.open(mode='rb') as file:
+            def write_stream(file):
+                current_bytes = 0
                 while True:
                     data = file.read(chunk_size)
                     if not data:
@@ -1233,6 +1334,11 @@ class Folder(DriveItem):
                         data = response.json()
                         return self._classifier(data)(parent=self, **{
                             self._cloud_data_key: data})
+            if stream:
+                return write_stream(stream)
+            else:
+                with item.open(mode='rb') as file:
+                    return write_stream(file)
 
 
 class Drive(ApiComponent):
@@ -1248,6 +1354,8 @@ class Drive(ApiComponent):
         'list_items': '/drives/{id}/root/children',
         'get_item_default': '/drive/items/{item_id}',
         'get_item': '/drives/{id}/items/{item_id}',
+        'get_item_by_path_default': '/drive/root:{item_path}',
+        'get_item_by_path': '/drives/{id}/root:{item_path}',
         'recent_default': '/drive/recent',
         'recent': '/drives/{id}/recent',
         'shared_with_me_default': '/drive/sharedWithMe',
@@ -1275,8 +1383,9 @@ class Drive(ApiComponent):
         self.parent = parent if isinstance(parent, Drive) else None
 
         # Choose the main_resource passed in kwargs over parent main_resource
-        main_resource = kwargs.pop('main_resource', None) or (
-            getattr(parent, 'main_resource', None) if parent else None)
+        main_resource = kwargs.pop('main_resource', None)
+        if main_resource is None:
+            main_resource = getattr(parent, 'main_resource', None) if parent else None
         super().__init__(
             protocol=parent.protocol if parent else kwargs.get('protocol'),
             main_resource=main_resource)
@@ -1310,8 +1419,15 @@ class Drive(ApiComponent):
         return self.__repr__()
 
     def __repr__(self):
-        return 'Drive: {}'.format(
-            self.name or self.object_id or 'Default Drive')
+        owner = str(self.owner) if self.owner else ''
+        name = self.name or self.object_id or 'Default Drive'
+        if owner:
+            return 'Drive: {} (Owned by: {})'.format(name, owner)
+        else:
+            return 'Drive: {}'.format(name)
+
+    def __eq__(self, other):
+        return self.object_id == other.object_id
 
     def get_root_folder(self):
         """ Returns the Root Folder of this drive
@@ -1350,11 +1466,11 @@ class Drive(ApiComponent):
             params['$orderby'] = order_by
 
         if query:
-            if query.has_filters:
-                warnings.warn(
-                    'Filters are not allowed by the Api Provider '
-                    'in this method')
-                query.clear_filters()
+            # if query.has_filters:
+            #     warnings.warn(
+            #         'Filters are not allowed by the Api Provider '
+            #         'in this method')
+            #     query.clear_filters()
             if isinstance(query, str):
                 params['$filter'] = query
             else:
@@ -1388,8 +1504,8 @@ class Drive(ApiComponent):
         :type order_by: Query or str
         :param int batch: batch size, retrieves items in
          batches allowing to retrieve more items than the limit.
-        :return: list of items in this folder
-        :rtype: list[DriveItem] or Pagination
+        :return: items in this folder
+        :rtype: generator of DriveItem or Pagination
         """
 
         if self.object_id:
@@ -1403,6 +1519,27 @@ class Drive(ApiComponent):
         return self._base_get_list(url, limit=limit, query=query,
                                    order_by=order_by, batch=batch)
 
+    def get_child_folders(self, limit=None, *, query=None, order_by=None, batch=None):
+        """ Returns all the folders inside this folder
+
+        :param int limit: max no. of folders to get. Over 999 uses batch.
+        :param query: applies a OData filter to the request
+        :type query: Query or str
+        :param order_by: orders the result set based on this condition
+        :type order_by: Query or str
+        :param int batch: batch size, retrieves items in
+         batches allowing to retrieve more items than the limit.
+        :return: folder items in this folder
+        :rtype: generator of DriveItem or Pagination
+        """
+
+        if query:
+            query = query.on_attribute('folder').unequal(None)
+        else:
+            query = self.q('folder').unequal(None)
+
+        return self.get_items(limit=limit, query=query, order_by=order_by, batch=batch)
+
     def get_recent(self, limit=None, *, query=None, order_by=None, batch=None):
         """ Returns a collection of recently used DriveItems
 
@@ -1413,8 +1550,8 @@ class Drive(ApiComponent):
         :type order_by: Query or str
         :param int batch: batch size, retrieves items in
          batches allowing to retrieve more items than the limit.
-        :return: list of items in this folder
-        :rtype: list[DriveItem] or Pagination
+        :return: items in this folder
+        :rtype: generator of DriveItem or Pagination
         """
         if self.object_id:
             # reference the current drive_id
@@ -1438,8 +1575,8 @@ class Drive(ApiComponent):
         :type order_by: Query or str
         :param int batch: batch size, retrieves items in
          batches allowing to retrieve more items than the limit.
-        :return: list of items in this folder
-        :rtype: list[DriveItem] or Pagination
+        :return: items in this folder
+        :rtype: generator of DriveItem or Pagination
         """
 
         if self.object_id:
@@ -1468,6 +1605,31 @@ class Drive(ApiComponent):
             # we don't know the drive_id so go to the default drive
             url = self.build_url(
                 self._endpoints.get('get_item_default').format(item_id=item_id))
+
+        response = self.con.get(url)
+        if not response:
+            return None
+
+        data = response.json()
+
+        # Everything received from cloud must be passed as self._cloud_data_key
+        return self._classifier(data)(parent=self,
+                                      **{self._cloud_data_key: data})
+
+    def get_item_by_path(self, item_path):
+        """ Returns a DriveItem by it's path: /path/to/file
+        :return: one item
+        :rtype: DriveItem
+        """
+        if self.object_id:
+            # reference the current drive_id
+            url = self.build_url(
+                self._endpoints.get('get_item_by_path').format(id=self.object_id,
+                                                               item_path=item_path))
+        else:
+            # we don't know the drive_id so go to the default drive
+            url = self.build_url(
+                self._endpoints.get('get_item_by_path_default').format(item_path=item_path))
 
         response = self.con.get(url)
         if not response:
@@ -1569,8 +1731,8 @@ class Drive(ApiComponent):
         :type order_by: Query or str
         :param int batch: batch size, retrieves items in
          batches allowing to retrieve more items than the limit.
-        :return: list of items in this folder
-        :rtype: list[DriveItem] or Pagination
+        :return: items in this folder matching search
+        :rtype: generator of DriveItem or Pagination
         """
         if not isinstance(search_text, str) or not search_text:
             raise ValueError('Provide a valid search_text')
@@ -1714,11 +1876,14 @@ class Storage(ApiComponent):
         url = self.build_url(self._endpoints.get('list_drives'))
 
         response = self.con.get(url)
+
         if not response:
             return []
 
         data = response.json()
 
         # Everything received from cloud must be passed as self._cloud_data_key
-        return [self.drive_constructor(parent=self, **{self._cloud_data_key: drive})
-                for drive in data.get('value', [])]
+        drives = [self.drive_constructor(parent=self, **{self._cloud_data_key: drive}) for
+                  drive in data.get('value', [])]
+
+        return drives

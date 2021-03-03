@@ -6,7 +6,18 @@ from tzlocal import get_localzone
 
 from O365.connection import Connection, Protocol, MSGraphProtocol, MSOffice365Protocol, DEFAULT_SCOPES
 
-TEST_SCOPES = ['Contacts.Read.Shared', 'Mail.Send.Shared', 'User.Read', 'Contacts.ReadWrite.Shared', 'Mail.ReadWrite.Shared', 'Mail.Read.Shared', 'Contacts.Read', 'Sites.ReadWrite.All', 'Mail.Send', 'Mail.ReadWrite', 'offline_access', 'Mail.Read', 'Contacts.ReadWrite', 'Files.ReadWrite.All', 'Calendars.ReadWrite', 'User.ReadBasic.All']
+TEST_SCOPES = [
+    'Calendars.Read', 'Calendars.Read.Shared', 'Calendars.ReadWrite', 'Calendars.ReadWrite.Shared',
+    'Contacts.Read', 'Contacts.Read.Shared', 'Contacts.ReadWrite', 'Contacts.ReadWrite.Shared',
+    'Files.Read.All', 'Files.ReadWrite.All',
+    'Mail.Read', 'Mail.Read.Shared', 'Mail.ReadWrite', 'Mail.ReadWrite.Shared', 'Mail.Send', 'Mail.Send.Shared',
+    'MailboxSettings.ReadWrite',
+    'Presence.Read',
+    'Sites.Read.All', 'Sites.ReadWrite.All',
+    'Tasks.Read', 'Tasks.ReadWrite',
+    'User.Read', 'User.ReadBasic.All',
+    'offline_access'
+    ]
 
 class TestProtocol:
 
@@ -51,17 +62,17 @@ class TestProtocol:
         assert(self.proto.get_scopes_for('mailbox') == ['Mail.Read'])
 
     def test_prefix_scope(self):
-        assert(self.proto._prefix_scope('Mail.Read') == 'Mail.Read')
+        assert(self.proto.prefix_scope('Mail.Read') == 'Mail.Read')
         
-        assert(self.proto._prefix_scope(('Mail.Read',)) == 'Mail.Read')
+        assert(self.proto.prefix_scope(('Mail.Read',)) == 'Mail.Read')
         
         self.proto.protocol_scope_prefix = 'test_prefix_'
         
-        assert(self.proto._prefix_scope(('Mail.Read',)) == 'Mail.Read')
+        assert(self.proto.prefix_scope(('Mail.Read',)) == 'Mail.Read')
         
-        assert(self.proto._prefix_scope('test_prefix_Mail.Read') == 'test_prefix_Mail.Read')
+        assert(self.proto.prefix_scope('test_prefix_Mail.Read') == 'test_prefix_Mail.Read')
         
-        assert(self.proto._prefix_scope('Mail.Read') == 'test_prefix_Mail.Read')
+        assert(self.proto.prefix_scope('Mail.Read') == 'test_prefix_Mail.Read')
 
     def test_decendant_MSOffice365Protocol(self):
         # Basically we just test that it can create the class w/o erroring.
