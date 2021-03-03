@@ -4,11 +4,11 @@ import os
 from setuptools import setup, find_packages
 
 
-VERSION = '2.0.14'
+VERSION = '2.0.14b'
 
 # Available classifiers: https://pypi.org/pypi?%3Aaction=list_classifiers
 CLASSIFIERS = [
-    'Development Status :: 3 - Alpha',
+    'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
     'License :: OSI Approved :: Apache Software License',
     'Topic :: Office/Business :: Office Suites',
