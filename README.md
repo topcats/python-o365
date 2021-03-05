@@ -93,13 +93,13 @@ O365 is available on pypi.org. Simply run `pip install O365` to install it.
 Requirements: >= Python 3.4
 
 Project dependencies installed by pip:
+ - beautifulsoup4
+ - python-dateutil
+ - pytz
  - requests
  - requests-oauthlib
- - beatifulsoup4
  - stringcase
- - python-dateutil
  - tzlocal
- - pytz
  
  
 ## Usage
