@@ -15,6 +15,8 @@ USERS_RESOURCE = 'users'
 GROUPS_RESOURCE = 'groups'
 SITES_RESOURCE = 'sites'
 
+
+
 NEXT_LINK_KEYWORD = '@odata.nextLink'
 
 log = logging.getLogger(__name__)
@@ -345,17 +347,20 @@ class ApiComponent:
     def _parse_resource(resource):
         """ Parses and completes resource information """
         resource = resource.strip() if resource else resource
-        if resource in {ME_RESOURCE, USERS_RESOURCE, GROUPS_RESOURCE, SITES_RESOURCE}:
+        resource_start = list(filter(lambda part: part, resource.split('/')))[0] if resource else resource
+
+        if ':' not in resource_start and '@' not in resource_start:
             return resource
-        elif resource.startswith('user:'):
-            # user resource shorthand
-            resource = resource.replace('user:', '', 1)
-            return '{}/{}'.format(USERS_RESOURCE, resource)
-        elif '@' in resource and not resource.startswith(USERS_RESOURCE):
+
+        if '@' in resource_start:
             # user resource backup
             # when for example accessing a shared mailbox the
             # resource is set to the email address. we have to prefix
             # the email with the resource 'users/' so --> 'users/email_address'
+            return '{}/{}'.format(USERS_RESOURCE, resource)
+        elif resource.startswith('user:'):
+            # user resource shorthand
+            resource = resource.replace('user:', '', 1)
             return '{}/{}'.format(USERS_RESOURCE, resource)
         elif resource.startswith('group:'):
             # group resource shorthand
@@ -406,7 +411,7 @@ class ApiComponent:
         """ Alias for protocol.convert_case """
         return self.protocol.convert_case(dict_key)
 
-    def _parse_date_time_time_zone(self, date_time_time_zone):
+    def _parse_date_time_time_zone(self, date_time_time_zone, is_all_day=False):
         """ Parses and convert to protocol timezone a dateTimeTimeZone resource
         This resource is a dict with a date time and a windows timezone
         This is a common structure on Microsoft apis so it's included here.
@@ -429,7 +434,10 @@ class ApiComponent:
                 date_time = None
 
             if date_time and timezone != local_tz:
-                date_time = date_time.astimezone(local_tz)
+                if not is_all_day:
+                    date_time = date_time.astimezone(local_tz)
+                else:
+                    date_time = date_time.replace(tzinfo=local_tz)
         else:
             # Outlook v1.0 api compatibility (fallback to datetime string)
             try:
@@ -581,7 +589,8 @@ class Query:
         'to': 'toRecipients/emailAddress/address',
         'start': 'start/DateTime',
         'end': 'end/DateTime',
-        'flag': 'flag/flagStatus'
+        'flag': 'flag/flagStatus',
+        'body': 'body/content'
     }
 
     def __init__(self, attribute=None, *, protocol):

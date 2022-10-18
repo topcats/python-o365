@@ -1,5 +1,5 @@
 from .connection import Connection, Protocol, MSGraphProtocol, MSOffice365Protocol
-from .utils import ME_RESOURCE
+from .utils import ME_RESOURCE, consent
 
 
 class Account:
@@ -34,11 +34,21 @@ class Account:
             # convert the provided scopes to protocol scopes:
             if scopes is not None:
                 kwargs['scopes'] = self.protocol.get_scopes_for(scopes)
-        elif auth_flow_type == 'credentials':
-            # for client credential grant flow solely:
-            # append the default scope if it's not provided
+        elif auth_flow_type in ('credentials', 'certificate'):
+            # for client credential grant flow solely: add the default scope if it's not provided
             if not scopes:
                 kwargs['scopes'] = [self.protocol.prefix_scope('.default')]
+            else:
+                raise ValueError(f'Auth flow type "{auth_flow_type}" does not require scopes')
+
+            # set main_resource to blank when it's the 'ME' resource
+            if self.protocol.default_resource == ME_RESOURCE:
+                self.protocol.default_resource = ''
+            if main_resource == ME_RESOURCE:
+                main_resource = ''
+
+        elif auth_flow_type == 'password':
+            kwargs['scopes'] = self.protocol.get_scopes_for(scopes) if scopes else [self.protocol.prefix_scope('.default')]
 
             # set main_resource to blank when it's the 'ME' resource
             if self.protocol.default_resource == ME_RESOURCE:
@@ -46,7 +56,8 @@ class Account:
             if main_resource == ME_RESOURCE:
                 main_resource = ''
         else:
-            raise ValueError('"auth_flow_type" must be "authorization", "credentials" or "public"')
+            raise ValueError('"auth_flow_type" must be "authorization", "credentials", "certificate", "password" or '
+                             '"public"')
 
         self.con = self.connection_constructor(credentials, **kwargs)
         self.main_resource = main_resource or self.protocol.default_resource
@@ -69,7 +80,7 @@ class Account:
 
         return token is not None and not token.is_expired
 
-    def authenticate(self, *, scopes=None, **kwargs):
+    def authenticate(self, *, scopes=None, handle_consent=consent.consent_input_token, **kwargs):
         """ Performs the oauth authentication flow using the console resulting in a stored token.
         It uses the credentials passed on instantiation
 
@@ -92,10 +103,7 @@ class Account:
 
             consent_url, _ = self.con.get_authorization_url(**kwargs)
 
-            print('Visit the following url to give consent:')
-            print(consent_url)
-
-            token_url = input('Paste the authenticated url here:\n')
+            token_url = handle_consent(consent_url)
 
             if token_url:
                 result = self.con.request_token(token_url, **kwargs)  # no need to pass state as the session is the same
@@ -109,10 +117,11 @@ class Account:
                 print('Authentication Flow aborted.')
                 return False
 
-        elif self.con.auth_flow_type == 'credentials':
+        elif self.con.auth_flow_type in ('credentials', 'certificate', 'password'):
             return self.con.request_token(None, requested_scopes=scopes)
         else:
-            raise ValueError('Connection "auth_flow_type" must be "authorization", "public" or "credentials"')
+            raise ValueError('Connection "auth_flow_type" must be "authorization", "public", "password", "certificate"'
+                             ' or "credentials"')
 
     def get_current_user(self):
         """ Returns the current user """
@@ -269,3 +278,13 @@ class Account:
         from .category import Categories
 
         return Categories(parent=self, main_resource=resource)
+
+    def groups(self, *, resource=''):
+        """ Get an instance to read information from Microsoft Groups """
+
+        if not isinstance(self.protocol, MSGraphProtocol):
+            raise RuntimeError(
+                'groups api only works on Microsoft Graph API')
+
+        from .groups import Groups
+        return Groups(parent=self, main_resource=resource)

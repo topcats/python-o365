@@ -2,6 +2,58 @@
 
 Almost every release features a lot of bugfixes but those are not listed here.
 
+
+## Version 2.0.21 (2022-09-23)
+
+###Features:
+- Bug fixing release
+
+## Version 2.0.20 (2022-08-26)
+
+### Features:
+- Teams: added pagination to `get_all_chats` (Thanks @jhoult).
+- Message: added access to inferenceClassification in msg object (Thanks @BlueSideStrongSide).
+- Connection: added proxy_http_only flag (Thanks @senor-vu).
+- Connection: added ROPC authentication flow (Thanks @pierfrancesto).
+- Connection: added new `EnvTokenBackend` (Thanks @pierfrancesto).
+ 
+  
+## Version 2.0.19 (2022-05-26)
+
+### Features:
+- Drive: added password and expiration date to share_with_link method (Thanks @MagestryMark).
+- Drive: support uploading large attachments from memory (Thanks @sebastiant).
+- Directory: added new methods: `get_user_manager` and `get_user_direct_reports` (Thanks @dionm).
+- Groups: Improvements to `Group` class (Thanks @Krukosz).
+
+
+## Version 2.0.18 (2022-02-03)
+
+### Features:
+- Updated requirements to use tzlocal >=4.0
+
+
+## Version 2.0.17 (2022-02-01)
+### Features:
+ - Groups: Added groups.py with some read functionality in Office 365 Groups. Thanks @Krukosz*
+ - Teams Chats and Chat Messages: Added to teams.py. Thanks @hcallen.
+
+
+## Version 2.0.16 (2021-09-12)
+### Features:
+ - Calendar: Added 'cancel_event' method
+ - Message: attachment existance is checked lazily
+
+
+## Version 2.0.15 (2021-05-25)
+### Features:
+ - Mailbox: upload attachments bigger than 4MB using MS Graph Protocol
+ - Account: added dynamic consent process using functions
+ - Drive: allow pulling DriveItems external to tenant
+ - Sharepoint: added support for list item fields 
+ - Tasks: added Task.importance and Task.is_starred
+
+
 ## Version 2.0.14 (2021-01-28)
 ### Features:
  - NEW: added MS Teams Presence class

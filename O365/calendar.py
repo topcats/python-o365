@@ -676,7 +676,7 @@ class Attendees(ApiComponent):
         return self.__attendees[key]
 
     def __contains__(self, item):
-        return item in {attendee.email for attendee in self.__attendees}
+        return item in {attendee.address for attendee in self.__attendees}
 
     def __len__(self):
         return len(self.__attendees)
@@ -861,11 +861,13 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self.__modified = parse(self.__modified).astimezone(
             local_tz) if self.__modified else None
 
+        self.__is_all_day = cloud_data.get(cc('isAllDay'), False)
+
         start_obj = cloud_data.get(cc('start'), {})
-        self.__start = self._parse_date_time_time_zone(start_obj)
+        self.__start = self._parse_date_time_time_zone(start_obj, self.__is_all_day)
 
         end_obj = cloud_data.get(cc('end'), {})
-        self.__end = self._parse_date_time_time_zone(end_obj)
+        self.__end = self._parse_date_time_time_zone(end_obj, self.__is_all_day)
 
         self.has_attachments = cloud_data.get(cc('hasAttachments'), False)
         self.__attachments = EventAttachments(parent=self, attachments=[])
@@ -875,7 +877,6 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self.ical_uid = cloud_data.get(cc('iCalUId'), None)
         self.__importance = ImportanceLevel.from_value(
             cloud_data.get(cc('importance'), 'normal') or 'normal')
-        self.__is_all_day = cloud_data.get(cc('isAllDay'), False)
         self.is_cancelled = cloud_data.get(cc('isCancelled'), False)
         self.is_organizer = cloud_data.get(cc('isOrganizer'), True)
         self.__location = cloud_data.get(cc('location'), {})
@@ -1507,6 +1508,31 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
 
         return bool(response)
 
+    def cancel_event(self, comment=None, *, send_response=True):
+        """ Cancel the event
+
+        :param str comment: comment to add
+        :param bool send_response: whether or not to send response back
+        :return: Success / Failure
+        :rtype: bool
+        """
+        if not self.object_id:
+            raise RuntimeError("Can't accept event that doesn't exist")
+
+        url = self.build_url(
+            self._endpoints.get('event').format(id=self.object_id))
+        url = url + '/cancel'
+
+        data = {}
+        if comment and isinstance(comment, str):
+            data[self._cc('comment')] = comment
+        if send_response is False:
+            data[self._cc('sendResponse')] = send_response
+
+        response = self.con.post(url, data=data or None)
+
+        return bool(response)
+
     def get_body_text(self):
         """ Parse the body html and returns the body text using bs4
 
@@ -1612,7 +1638,7 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
         if not self.calendar_id:
             return False
 
-        url = self.build_url(self._endpoints.get('calendar'))
+        url = self.build_url(self._endpoints.get('calendar').format(id=self.calendar_id))
 
         data = {
             self._cc('name'): self.name,

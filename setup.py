@@ -1,10 +1,9 @@
-#!/usr/bin/python3
 import os
 
 from setuptools import setup, find_packages
 
 
-VERSION = '2.0.14b'
+VERSION = '2.0.21'
 
 # Available classifiers: https://pypi.org/pypi?%3Aaction=list_classifiers
 CLASSIFIERS = [
@@ -21,6 +20,7 @@ CLASSIFIERS = [
     'Programming Language :: Python :: 3.7',
     'Programming Language :: Python :: 3.8',
     'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
     'Operating System :: OS Independent',
 ]
 
@@ -35,7 +35,7 @@ requires = [
     'requests_oauthlib>=1.2.0',
     'python-dateutil>=2.7',
     'pytz>=2018.5',
-    'tzlocal>=1.5.0',
+    'tzlocal>=4.0',
     'beautifulsoup4>=4.0.0',
     'stringcase>=1.2.0'
 ]
@@ -45,16 +45,17 @@ setup(
     version=VERSION,
     # packages=['O365', 'O365.utils'],
     packages=find_packages(),
-    url='https://github.com/topcats/python-o365',
+    url='https://github.com/O365/python-o365',
     license='Apache License 2.0',
-    author='topcats (Janscas, Roycem90, Narcolapser)',
-    author_email='topcats@users.noreply.github.com',
-    maintainer='topcats',
-    maintainer_email='topcats@users.noreply.github.com',
+    author='Janscas, Roycem90, Narcolapser',
+    author_email='janscas@users.noreply.github.com',
+    maintainer='Janscas',
+    maintainer_email='janscas@users.noreply.github.com',
     description='Microsoft Graph and Office 365 API made easy',
     long_description=read('README.md'),
     long_description_content_type="text/markdown",
     classifiers=CLASSIFIERS,
     python_requires=">=3.4",
     install_requires=requires,
+    setup_requires=["wheel"],
 )
