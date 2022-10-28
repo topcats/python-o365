@@ -1,7 +1,7 @@
 import logging
 
 from dateutil.parser import parse
-from .utils import ApiComponent
+from .utils import Pagination, NEXT_LINK_KEYWORD, ApiComponent
 from .directory import User
 
 log = logging.getLogger(__name__)
@@ -12,6 +12,8 @@ class Group(ApiComponent):
     _endpoints = {
             'get_group_owners': '/groups/{group_id}/owners',
             'get_group_members': '/groups/{group_id}/members',
+            'get_group_events': '/groups/{group_id}/calendar/events',
+            'get_group_events_view': '/groups/{group_id}/calendar/calendarView',
     }
 
     member_constructor = User
@@ -103,6 +105,100 @@ class Group(ApiComponent):
         data = response.json()
 
         return [self.member_constructor(parent=self, **{self._cloud_data_key: lst}) for lst in data.get('value', [])]
+
+
+    def get_group_events(self, limit=25, *, query=None, order_by=None, batch=None,
+                   download_attachments=False, include_recurring=True):
+        """ Get events from the this Calendar
+
+        :param int limit: max no. of events to get. Over 999 uses batch.
+        :param query: applies a OData filter to the request
+        :type query: Query or str
+        :param order_by: orders the result set based on this condition
+        :type order_by: Query or str
+        :param int batch: batch size, retrieves items in
+         batches allowing to retrieve more items than the limit.
+        :param download_attachments: downloads event attachments
+        :param bool include_recurring: whether to include recurring events or not
+        :return: list of events in this calendar
+        :rtype: list[Event] or Pagination
+        """
+
+        if include_recurring:
+            url = self.build_url(
+                self._endpoints.get('get_group_events_view').format(id=self.calendar_id))
+        else:
+            url = self.build_url(
+                self._endpoints.get('get_group_events').format(id=self.calendar_id))
+
+        if limit is None or limit > self.protocol.max_top_value:
+            batch = self.protocol.max_top_value
+
+        if batch:
+            download_attachments = False
+
+        params = {'$top': batch if batch else limit}
+
+        if include_recurring:
+            start = None
+            end = None
+            if query and not isinstance(query, str):
+                # extract start and end from query because
+                # those are required by a calendarView
+                for query_data in query._filters:
+                    if not isinstance(query_data, list):
+                        continue
+                    attribute = query_data[0]
+                    # the 2nd position contains the filter data
+                    # and the 3rd position in filter_data contains the value
+                    word = query_data[2][3]
+
+                    if attribute.lower().startswith('start/'):
+                        start = word.replace("'", '')  # remove the quotes
+                        query.remove_filter('start')
+                    if attribute.lower().startswith('end/'):
+                        end = word.replace("'", '')  # remove the quotes
+                        query.remove_filter('end')
+
+            if start is None or end is None:
+                raise ValueError("When 'include_recurring' is True you must provide a 'start' and 'end' datetimes inside a Query instance.")
+
+            if end < start:
+                raise ValueError('When using "include_recurring=True", the date asigned to the "end" datetime'
+                                 ' should be greater or equal than the date asigned to the "start" datetime.')
+
+            params[self._cc('startDateTime')] = start
+            params[self._cc('endDateTime')] = end
+
+        if order_by:
+            params['$orderby'] = order_by
+
+        if query:
+            if isinstance(query, str):
+                params['$filter'] = query
+            else:
+                params.update(query.as_params())
+
+        response = self.con.get(url, params=params,
+                                headers={'Prefer': 'outlook.timezone="UTC"'})
+        if not response:
+            return iter(())
+
+        data = response.json()
+
+        # Everything received from cloud must be passed as self._cloud_data_key
+        events = (self.event_constructor(parent=self,
+                                         download_attachments=
+                                         download_attachments,
+                                         **{self._cloud_data_key: event})
+                  for event in data.get('value', []))
+        next_link = data.get(NEXT_LINK_KEYWORD, None)
+        if batch and next_link:
+            return Pagination(parent=self, data=events,
+                              constructor=self.event_constructor,
+                              next_link=next_link, limit=limit)
+        else:
+            return events
 
 class Groups(ApiComponent):
     """ A microsoft groups class
