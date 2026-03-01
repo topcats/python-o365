@@ -126,10 +126,10 @@ class Group(ApiComponent):
 
         if include_recurring:
             url = self.build_url(
-                self._endpoints.get('get_group_events_view').format(id=self.calendar_id))
+                self._endpoints.get('get_group_events_view').format(group_id=self.object_id))
         else:
             url = self.build_url(
-                self._endpoints.get('get_group_events').format(id=self.calendar_id))
+                self._endpoints.get('get_group_events').format(group_id=self.object_id))
 
         if limit is None or limit > self.protocol.max_top_value:
             batch = self.protocol.max_top_value

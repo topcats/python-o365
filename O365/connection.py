@@ -55,7 +55,8 @@ DEFAULT_SCOPES = {
     'settings_all': ['MailboxSettings.ReadWrite'],
     'tasks': ['Tasks.Read'],
     'tasks_all': ['Tasks.ReadWrite'],
-    'presence': ['Presence.Read']
+    'presence': ['Presence.Read'],
+    'group_read_all':['Group.Read.All']
 }
 
 
